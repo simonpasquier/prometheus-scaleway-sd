@@ -16,7 +16,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -36,7 +38,7 @@ var (
 	organization = a.Flag("scw.organization", "The Scaleway organization.").Default("").String()
 	region       = a.Flag("scw.region", "The Scaleway region.").Default("par1").String()
 	token        = a.Flag("scw.token", "The authentication token.").Default("").String()
-	tokenf       = a.Flag("scw.token_file", "The authentication token file.").Default("").String()
+	tokenf       = a.Flag("scw.token-file", "The authentication token file.").Default("").String()
 	logger       log.Logger
 
 	// identifierLabel is the name for the label containing the server's identifier.
@@ -47,6 +49,25 @@ var (
 	tagsLabel = model.MetaLabelPrefix + "scaleway_tags"
 	// TODO: add more labels
 )
+
+type scwLogger struct {
+	log.Logger
+}
+
+func (l *scwLogger) LogHTTP(*http.Request) {
+}
+func (l *scwLogger) Fatalf(format string, v ...interface{}) {
+	level.Error(l).Log("msg", fmt.Sprintf(format, v))
+}
+func (l *scwLogger) Debugf(format string, v ...interface{}) {
+	level.Debug(l).Log("msg", fmt.Sprintf(format, v))
+}
+func (l *scwLogger) Infof(format string, v ...interface{}) {
+	level.Info(l).Log("msg", fmt.Sprintf(format, v))
+}
+func (l *scwLogger) Warnf(format string, v ...interface{}) {
+	level.Warn(l).Log("msg", fmt.Sprintf(format, v))
+}
 
 // scwDiscoverer retrieves target information from the Scaleway API.
 type scwDiscoverer struct {
@@ -67,7 +88,8 @@ func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) (*targetgroup.Gr
 		Targets: []model.LabelSet{
 			model.LabelSet{
 				model.AddressLabel: model.LabelValue(addr),
-			}},
+			},
+		},
 		Labels: model.LabelSet{
 			model.AddressLabel:               model.LabelValue(addr),
 			model.LabelName(identifierLabel): model.LabelValue(srv.Identifier),
@@ -108,20 +130,45 @@ func main() {
 
 	_, err := a.Parse(os.Args[1:])
 	if err != nil {
-		fmt.Println("err: ", err)
-		return
+		fmt.Println(err)
+		os.Exit(1)
 	}
 	logger = log.NewSyncLogger(log.NewLogfmtLogger(os.Stdout))
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
 
-	client, err := api.NewScalewayAPI(*organization, *token, "Prometheus/SD-Agent", *region)
+	if *token == "" && *tokenf == "" {
+		fmt.Println("need to pass --scw.token or --scw.token-file")
+		os.Exit(1)
+	}
+	if *tokenf != "" {
+		if *token != "" {
+			fmt.Println("cannot pass --scw.token and --scw.token-file at the same time")
+			os.Exit(1)
+		}
+		b, err := ioutil.ReadFile(*tokenf)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		*token = strings.TrimSpace(strings.TrimRight(string(b), "\n"))
+	}
+
+	client, err := api.NewScalewayAPI(
+		*organization,
+		*token,
+		"Prometheus/SD-Agent",
+		*region,
+		func(s *api.ScalewayAPI) {
+			s.Logger = &scwLogger{logger}
+		},
+	)
 	if err != nil {
-		fmt.Println("failed to create Scaleway API client: ", err)
+		fmt.Println("failed to create Scaleway API client:", err)
 		os.Exit(1)
 	}
 	err = client.CheckCredentials()
 	if err != nil {
-		fmt.Println("failed to check Scaleway credentials: ", err)
+		fmt.Println("failed to check Scaleway credentials:", err)
 		os.Exit(1)
 	}
 
