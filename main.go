@@ -35,19 +35,52 @@ import (
 var (
 	a            = kingpin.New("sd adapter usage", "Tool to generate Prometheus file_sd target files for Scaleway.")
 	outputf      = a.Flag("output.file", "The output filename for file_sd compatible file.").Default("scw.json").String()
-	organization = a.Flag("scw.organization", "The Scaleway organization.").Default("").String()
+	organization = a.Flag("scw.organization", "The Scaleway organization (access key).").Required().String()
 	region       = a.Flag("scw.region", "The Scaleway region.").Default("par1").String()
-	token        = a.Flag("scw.token", "The authentication token.").Default("").String()
+	token        = a.Flag("scw.token", "The authentication token (secret key).").Default("").String()
 	tokenf       = a.Flag("scw.token-file", "The authentication token file.").Default("").String()
-	logger       log.Logger
+	refresh      = a.Flag("target.refresh", "The refresh interval (in seconds).").Default("30").Int()
+	port         = a.Flag("target.port", "The default port number.").Default("80").Int()
 
+	logger log.Logger
+
+	scwPrefix = model.MetaLabelPrefix + "scaleway_"
+	// archLabel is the name for the label containing the server's architecture.
+	archLabel = scwPrefix + "architecture"
+	// commercialTypeLabel is the name for the label containing the server's commercial type.
+	commercialTypeLabel = scwPrefix + "commercial_type"
 	// identifierLabel is the name for the label containing the server's identifier.
-	identifierLabel = model.MetaLabelPrefix + "scaleway_identifier"
+	identifierLabel = scwPrefix + "identifier"
 	// nodeLabel is the name for the label containing the server's name.
-	nameLabel = model.MetaLabelPrefix + "scaleway_name"
-	// tagLabel is the name for the label containing all the server's tags.
-	tagsLabel = model.MetaLabelPrefix + "scaleway_tags"
-	// TODO: add more labels
+	nameLabel = scwPrefix + "name"
+	// imageIDLabel is the name for the label containing the server's image ID.
+	imageIDLabel = scwPrefix + "image_id"
+	// imageNameLabel is the name for the label containing the server's image name.
+	imageNameLabel = scwPrefix + "image_name"
+	// orgLabel is the name for the label containing the server's organization.
+	orgLabel = scwPrefix + "organization"
+	// privateIPLabel is the name for the label containing the server's private IP.
+	privateIPLabel = scwPrefix + "private_ip"
+	// publicIPLabel is the name for the label containing the server's public IP.
+	publicIPLabel = scwPrefix + "public_ip"
+	// stateLabel is the name for the label containing the server's state.
+	stateLabel = scwPrefix + "state"
+	// tagsLabel is the name for the label containing all the server's tags.
+	tagsLabel = scwPrefix + "tags"
+	// platformLabel is the name for the label containing all the server's platform location.
+	platformLabel = scwPrefix + "platform_id"
+	// hypervisorLabel is the name for the label containing all the server's hypervisor location.
+	hypervisorLabel = scwPrefix + "hypervisor_id"
+	// nodeLabel is the name for the label containing all the server's node location.
+	nodeLabel = scwPrefix + "node_id"
+	// bladeLabel is the name for the label containing all the server's blade location.
+	bladeLabel = scwPrefix + "blade_id"
+	// chassisLabel is the name for the label containing all the server's chassis location.
+	chassisLabel = scwPrefix + "chassis_id"
+	// clusterLabel is the name for the label containing all the server's cluster location.
+	clusterLabel = scwPrefix + "cluster_id"
+	// zoneLabel is the name for the label containing all the server's zone location.
+	zoneLabel = scwPrefix + "zone_id"
 )
 
 type scwLogger struct {
@@ -76,11 +109,17 @@ type scwDiscoverer struct {
 	refresh   int
 	separator string
 
+	lasts map[string]struct{}
+
 	logger log.Logger
 }
 
 func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) (*targetgroup.Group, error) {
-	tags := d.separator + strings.Join(srv.Tags, d.separator) + d.separator
+	var tags string
+	if len(srv.Tags) > 0 {
+		tags = d.separator + strings.Join(srv.Tags, d.separator) + d.separator
+	}
+
 	addr := net.JoinHostPort(srv.PrivateIP, fmt.Sprintf("%d", d.port))
 
 	return &targetgroup.Group{
@@ -91,10 +130,25 @@ func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) (*targetgroup.Gr
 			},
 		},
 		Labels: model.LabelSet{
-			model.AddressLabel:               model.LabelValue(addr),
-			model.LabelName(identifierLabel): model.LabelValue(srv.Identifier),
-			model.LabelName(nameLabel):       model.LabelValue(srv.Name),
-			model.LabelName(tagsLabel):       model.LabelValue(tags),
+			model.AddressLabel:                   model.LabelValue(addr),
+			model.LabelName(archLabel):           model.LabelValue(srv.Arch),
+			model.LabelName(commercialTypeLabel): model.LabelValue(srv.CommercialType),
+			model.LabelName(identifierLabel):     model.LabelValue(srv.Identifier),
+			model.LabelName(imageIDLabel):        model.LabelValue(srv.Image.Identifier),
+			model.LabelName(imageNameLabel):      model.LabelValue(srv.Image.Name),
+			model.LabelName(nameLabel):           model.LabelValue(srv.Name),
+			model.LabelName(orgLabel):            model.LabelValue(srv.Organization),
+			model.LabelName(privateIPLabel):      model.LabelValue(srv.PrivateIP),
+			model.LabelName(publicIPLabel):       model.LabelValue(srv.PublicAddress.IP),
+			model.LabelName(stateLabel):          model.LabelValue(srv.State),
+			model.LabelName(tagsLabel):           model.LabelValue(tags),
+			model.LabelName(platformLabel):       model.LabelValue(srv.Location.Platform),
+			model.LabelName(hypervisorLabel):     model.LabelValue(srv.Location.Hypervisor),
+			model.LabelName(nodeLabel):           model.LabelValue(srv.Location.Node),
+			model.LabelName(bladeLabel):          model.LabelValue(srv.Location.Blade),
+			model.LabelName(chassisLabel):        model.LabelValue(srv.Location.Chassis),
+			model.LabelName(clusterLabel):        model.LabelValue(srv.Location.Cluster),
+			model.LabelName(zoneLabel):           model.LabelValue(srv.Location.ZoneID),
 		},
 	}, nil
 }
@@ -102,19 +156,33 @@ func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) (*targetgroup.Gr
 func (d *scwDiscoverer) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	for c := time.Tick(time.Duration(d.refresh) * time.Second); ; {
 		srvs, err := d.client.GetServers(false, 0)
+		level.Debug(d.logger).Log("msg", "get servers", "nb", len(*srvs))
 
+		var current = make(map[string]struct{})
 		var tgs []*targetgroup.Group
 		for _, s := range *srvs {
 			tg, err := d.createTarget(&s)
 			if err != nil {
-				level.Error(d.logger).Log("msg", "Error processing server", "server", s.Name, "id", s.Identifier, "err", err)
+				level.Error(d.logger).Log("msg", "error processing server", "server", s.Name, "id", s.Identifier, "err", err)
 				break
 			}
+			level.Debug(d.logger).Log("msg", "server added", "source", tg.Source)
+			current[tg.Source] = struct{}{}
 			tgs = append(tgs, tg)
 		}
+
 		if err == nil {
+			// Send updates for servers which have been removed since the last refresh.
+			for k := range d.lasts {
+				if _, ok := current[k]; !ok {
+					level.Debug(d.logger).Log("msg", "server deleted", "source", k)
+					tgs = append(tgs, &targetgroup.Group{Source: k})
+				}
+			}
+			d.lasts = current
 			ch <- tgs
 		}
+
 		// Wait for ticker or exit when ctx is closed.
 		select {
 		case <-c:
@@ -175,10 +243,11 @@ func main() {
 	ctx := context.Background()
 	disc := &scwDiscoverer{
 		client:    client,
-		port:      80,
-		refresh:   30,
+		port:      *port,
+		refresh:   *refresh,
 		separator: ",",
 		logger:    logger,
+		lasts:     make(map[string]struct{}),
 	}
 	sdAdapter := NewAdapter(ctx, *outputf, "scalewaySD", disc, logger)
 	sdAdapter.Run()
