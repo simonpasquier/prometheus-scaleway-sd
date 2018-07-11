@@ -25,7 +25,10 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/scaleway/go-scaleway"
 	"github.com/scaleway/go-scaleway/types"
@@ -40,7 +43,8 @@ var (
 	token        = a.Flag("scw.token", "The authentication token (secret key).").Default("").String()
 	tokenf       = a.Flag("scw.token-file", "The authentication token file.").Default("").String()
 	refresh      = a.Flag("target.refresh", "The refresh interval (in seconds).").Default("30").Int()
-	port         = a.Flag("target.port", "The default port number.").Default("80").Int()
+	port         = a.Flag("target.port", "The default port number for targets.").Default("80").Int()
+	listen       = a.Flag("web.listen-address", "The listen address.").Default(":9465").String()
 
 	logger log.Logger
 
@@ -83,6 +87,28 @@ var (
 	zoneLabel = scwPrefix + "zone_id"
 )
 
+var (
+	requestDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "prometheus_scaleway_sd_request_duration_seconds",
+			Help:    "Histogram of latencies for requests to the Scaleway API.",
+			Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0},
+		},
+	)
+	requestFailures = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "prometheus_scaleway_sd_request_failures_total",
+			Help: "Total number of failed requests to the Scaleway API.",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(version.NewCollector("prometheus_scaleway_sd"))
+	prometheus.MustRegister(requestDuration)
+	prometheus.MustRegister(requestFailures)
+}
+
 type scwLogger struct {
 	log.Logger
 }
@@ -108,13 +134,11 @@ type scwDiscoverer struct {
 	port      int
 	refresh   int
 	separator string
-
-	lasts map[string]struct{}
-
-	logger log.Logger
+	lasts     map[string]struct{}
+	logger    log.Logger
 }
 
-func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) (*targetgroup.Group, error) {
+func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) *targetgroup.Group {
 	var tags string
 	if len(srv.Tags) > 0 {
 		tags = d.separator + strings.Join(srv.Tags, d.separator) + d.separator
@@ -150,36 +174,45 @@ func (d *scwDiscoverer) createTarget(srv *types.ScalewayServer) (*targetgroup.Gr
 			model.LabelName(clusterLabel):        model.LabelValue(srv.Location.Cluster),
 			model.LabelName(zoneLabel):           model.LabelValue(srv.Location.ZoneID),
 		},
-	}, nil
+	}
+}
+
+func (d *scwDiscoverer) getTargets() ([]*targetgroup.Group, error) {
+	now := time.Now()
+	srvs, err := d.client.GetServers(false, 0)
+	requestDuration.Observe(time.Since(now).Seconds())
+	if err != nil {
+		requestFailures.Inc()
+		return nil, err
+	}
+
+	level.Debug(d.logger).Log("msg", "get servers", "nb", len(*srvs))
+
+	current := make(map[string]struct{})
+	tgs := make([]*targetgroup.Group, len(*srvs))
+	for _, s := range *srvs {
+		tg := d.createTarget(&s)
+		level.Debug(d.logger).Log("msg", "server added", "source", tg.Source)
+		current[tg.Source] = struct{}{}
+		tgs = append(tgs, tg)
+	}
+
+	// Add empty groups for servers which have been removed since the last refresh.
+	for k := range d.lasts {
+		if _, ok := current[k]; !ok {
+			level.Debug(d.logger).Log("msg", "server deleted", "source", k)
+			tgs = append(tgs, &targetgroup.Group{Source: k})
+		}
+	}
+	d.lasts = current
+
+	return tgs, nil
 }
 
 func (d *scwDiscoverer) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	for c := time.Tick(time.Duration(d.refresh) * time.Second); ; {
-		srvs, err := d.client.GetServers(false, 0)
-		level.Debug(d.logger).Log("msg", "get servers", "nb", len(*srvs))
-
-		var current = make(map[string]struct{})
-		var tgs []*targetgroup.Group
-		for _, s := range *srvs {
-			tg, err := d.createTarget(&s)
-			if err != nil {
-				level.Error(d.logger).Log("msg", "error processing server", "server", s.Name, "id", s.Identifier, "err", err)
-				break
-			}
-			level.Debug(d.logger).Log("msg", "server added", "source", tg.Source)
-			current[tg.Source] = struct{}{}
-			tgs = append(tgs, tg)
-		}
-
+		tgs, err := d.getTargets()
 		if err == nil {
-			// Send updates for servers which have been removed since the last refresh.
-			for k := range d.lasts {
-				if _, ok := current[k]; !ok {
-					level.Debug(d.logger).Log("msg", "server deleted", "source", k)
-					tgs = append(tgs, &targetgroup.Group{Source: k})
-				}
-			}
-			d.lasts = current
 			ch <- tgs
 		}
 
@@ -195,6 +228,8 @@ func (d *scwDiscoverer) Run(ctx context.Context, ch chan<- []*targetgroup.Group)
 
 func main() {
 	a.HelpFlag.Short('h')
+
+	a.Version(version.Print("prometheus-scaleway-sd"))
 
 	_, err := a.Parse(os.Args[1:])
 	if err != nil {
@@ -252,5 +287,10 @@ func main() {
 	sdAdapter := NewAdapter(ctx, *outputf, "scalewaySD", disc, logger)
 	sdAdapter.Run()
 
-	<-ctx.Done()
+	level.Debug(logger).Log("msg", "listening for connections", "addr", *listen)
+	http.Handle("/metrics", promhttp.Handler())
+	if err := http.ListenAndServe(*listen, nil); err != nil {
+		level.Debug(logger).Log("msg", "failed to listen", "addr", *listen, "err", err)
+		os.Exit(1)
+	}
 }
