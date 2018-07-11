@@ -115,31 +115,34 @@ type scwLogger struct {
 }
 
 // LogHTTP implements the Logger interface of the Scaleway API.
-func (l *scwLogger) LogHTTP(*http.Request) {}
+func (l *scwLogger) LogHTTP(r *http.Request) {
+	level.Debug(l).Log("msg", "HTTP request", "method", r.Method, "url", r.URL.String())
+}
 
 // Fatalf implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Fatalf(format string, v ...interface{}) {
-	level.Error(l).Log("msg", fmt.Sprintf(format, v))
+	level.Error(l).Log("msg", fmt.Sprintf(format, v...))
+	os.Exit(1)
 }
 
 // Debugf implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Debugf(format string, v ...interface{}) {
-	level.Debug(l).Log("msg", fmt.Sprintf(format, v))
+	level.Debug(l).Log("msg", fmt.Sprintf(format, v...))
 }
 
 // Infof implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Infof(format string, v ...interface{}) {
-	level.Info(l).Log("msg", fmt.Sprintf(format, v))
+	level.Info(l).Log("msg", fmt.Sprintf(format, v...))
 }
 
 // Warnf implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Warnf(format string, v ...interface{}) {
-	level.Warn(l).Log("msg", fmt.Sprintf(format, v))
+	level.Warn(l).Log("msg", fmt.Sprintf(format, v...))
 }
 
 // Warnf implements the Logger interface of the promhttp package.
 func (l *scwLogger) Println(v ...interface{}) {
-	level.Error(l).Log("msg", fmt.Sprintln(v))
+	level.Error(l).Log("msg", fmt.Sprintln(v...))
 }
 
 // scwDiscoverer retrieves target information from the Scaleway API.
