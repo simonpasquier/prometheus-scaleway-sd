@@ -46,8 +46,6 @@ var (
 	port         = a.Flag("target.port", "The default port number for targets.").Default("80").Int()
 	listen       = a.Flag("web.listen-address", "The listen address.").Default(":9465").String()
 
-	logger log.Logger
-
 	scwPrefix = model.MetaLabelPrefix + "scaleway_"
 	// archLabel is the name for the label containing the server's architecture.
 	archLabel = scwPrefix + "architecture"
@@ -88,6 +86,7 @@ var (
 )
 
 var (
+	reg             = prometheus.NewRegistry()
 	requestDuration = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "prometheus_scaleway_sd_request_duration_seconds",
@@ -104,28 +103,43 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(version.NewCollector("prometheus_scaleway_sd"))
-	prometheus.MustRegister(requestDuration)
-	prometheus.MustRegister(requestFailures)
+	reg.MustRegister(prometheus.NewProcessCollector(os.Getpid(), ""))
+	reg.MustRegister(prometheus.NewGoCollector())
+	reg.MustRegister(version.NewCollector("prometheus_scaleway_sd"))
+	reg.MustRegister(requestDuration)
+	reg.MustRegister(requestFailures)
 }
 
 type scwLogger struct {
 	log.Logger
 }
 
-func (l *scwLogger) LogHTTP(*http.Request) {
-}
+// LogHTTP implements the Logger interface of the Scaleway API.
+func (l *scwLogger) LogHTTP(*http.Request) {}
+
+// Fatalf implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Fatalf(format string, v ...interface{}) {
 	level.Error(l).Log("msg", fmt.Sprintf(format, v))
 }
+
+// Debugf implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Debugf(format string, v ...interface{}) {
 	level.Debug(l).Log("msg", fmt.Sprintf(format, v))
 }
+
+// Infof implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Infof(format string, v ...interface{}) {
 	level.Info(l).Log("msg", fmt.Sprintf(format, v))
 }
+
+// Warnf implements the Logger interface of the Scaleway API.
 func (l *scwLogger) Warnf(format string, v ...interface{}) {
 	level.Warn(l).Log("msg", fmt.Sprintf(format, v))
+}
+
+// Warnf implements the Logger interface of the promhttp package.
+func (l *scwLogger) Println(v ...interface{}) {
+	level.Error(l).Log("msg", fmt.Sprintln(v))
 }
 
 // scwDiscoverer retrieves target information from the Scaleway API.
@@ -236,8 +250,13 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	logger = log.NewSyncLogger(log.NewLogfmtLogger(os.Stdout))
-	logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+	logger := &scwLogger{
+		log.With(
+			log.NewSyncLogger(log.NewLogfmtLogger(os.Stdout)),
+			"ts", log.DefaultTimestampUTC,
+			"caller", log.DefaultCaller,
+		),
+	}
 
 	if *token == "" && *tokenf == "" {
 		fmt.Println("need to pass --scw.token or --scw.token-file")
@@ -262,7 +281,7 @@ func main() {
 		"Prometheus/SD-Agent",
 		*region,
 		func(s *api.ScalewayAPI) {
-			s.Logger = &scwLogger{logger}
+			s.Logger = logger
 		},
 	)
 	if err != nil {
@@ -288,7 +307,7 @@ func main() {
 	sdAdapter.Run()
 
 	level.Debug(logger).Log("msg", "listening for connections", "addr", *listen)
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{ErrorLog: logger}))
 	if err := http.ListenAndServe(*listen, nil); err != nil {
 		level.Debug(logger).Log("msg", "failed to listen", "addr", *listen, "err", err)
 		os.Exit(1)
