@@ -10,7 +10,7 @@ You need your Scaleway access key (organization) and secret key (token).
 
 ## Installing it
 
-Download the binary from the Releases page.
+Download the binary from the [Releases](https://github.com/simonpasquier/prometheus-scaleway-sd/releases) page.
 
 ## Running it
 
