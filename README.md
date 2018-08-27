@@ -1,3 +1,5 @@
+**This repository is unmaintained. Please use https://github.com/scaleway/prometheus-scw-sd which is a drop-in replacement.**
+
 A service discovery for the [Scaleway](https://www.scaleway.com/) cloud platform compatible with [Prometheus](https://prometheus.io).
 
 ## How it works
